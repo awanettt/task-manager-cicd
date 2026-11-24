@@ -1,0 +1,174 @@
+name: Java Application CI
+
+# --------------------------------------------------
+# События, запускающие Workflow
+# --------------------------------------------------
+on:
+
+  # Запуск при отправке изменений в указанные ветки.
+  push:
+    branches:
+      - main
+      - "feature/**"
+
+  # Запуск при создании или обновлении PR
+  # с целевой веткой main.
+  pull_request:
+    branches:
+      - main
+
+  # Возможность ручного запуска из GitHub UI.
+  workflow_dispatch:
+    inputs:
+      run_docker:
+        description: 'Run optional Docker build and smoke test'
+        required: true
+        type: boolean
+        default: false
+
+# --------------------------------------------------
+# Минимальные права Workflow
+# --------------------------------------------------
+permissions:
+  contents: read
+
+# --------------------------------------------------
+# Управление параллельными запусками
+# --------------------------------------------------
+concurrency:
+  group: java-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ==================================================
+  # Основное задание: сборка и тестирование
+  # ==================================================
+  verify:
+
+    name: Build, unit and integration tests
+
+    # Используется GitHub-hosted Windows runner.
+    runs-on: windows-latest
+
+    steps:
+
+      # ------------------------------------------------
+      # Шаг 1. Получение исходного кода
+      # ------------------------------------------------
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------
+      # Шаг 2. Установка JDK 21
+      # ------------------------------------------------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # ------------------------------------------------
+      # Шаг 3. Проверка программного окружения
+      # ------------------------------------------------
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          java -version
+          mvn -version
+          git --version
+
+      # ------------------------------------------------
+      # Шаг 4. Сборка и выполнение тестов
+      # ------------------------------------------------
+      - name: Build and verify
+        shell: pwsh
+        run: mvn -B -ntp clean verify
+
+      # ------------------------------------------------
+      # Шаг 5. Формирование HTML-отчёта Surefire
+      # Выполняется и при неуспешной сборке.
+      # ------------------------------------------------
+      - name: Generate Surefire HTML report
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'target/surefire-reports') {
+            mvn -B -ntp surefire-report:report-only
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          } else {
+            Write-Host 'Surefire reports are absent.'
+          }
+
+      # ------------------------------------------------
+      # Шаг 6. Формирование HTML-отчёта JaCoCo
+      # ------------------------------------------------
+      - name: Generate JaCoCo HTML report
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'target/jacoco.exec') {
+            mvn -B -ntp jacoco:report
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          } else {
+            Write-Host 'JaCoCo execution data is absent.'
+          }
+
+      # ------------------------------------------------
+      # Шаг 7. Публикация тестовых и coverage-отчётов
+      # ------------------------------------------------
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-windows
+          path: |
+            target/surefire-reports/**
+            target/failsafe-reports/**
+            target/site/surefire-report.html
+            target/site/jacoco/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ------------------------------------------------
+      # Шаг 8. Публикация JAR
+      # Только при успешном выполнении Job.
+      # ------------------------------------------------
+      - name: Upload executable JAR
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-manager-jar
+          path: target/task-manager-cicd-*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==================================================
+  # Необязательное задание Docker
+  # ==================================================
+  docker-build-smoke-test:
+
+    # Запускается только при ручном запуске
+    # с установленным флажком run_docker = true.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_docker }}
+
+    name: Build and smoke-test Linux image
+
+    # Ожидает успешного завершения основного Job.
+    needs: verify
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t task-manager-cicd:ci .
+        # Дополнительный smoke test следует реализовать
+        # в соответствии с фактическим Dockerfile.
