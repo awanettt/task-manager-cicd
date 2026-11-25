@@ -1,23 +1,20 @@
 name: Java Application CI
 
 # --------------------------------------------------
-# События, запускающие Workflow
+# Триггеры
 # --------------------------------------------------
 on:
-
-  # Запуск при отправке изменений в указанные ветки.
   push:
     branches:
       - main
       - "feature/**"
 
-  # Запуск при создании или обновлении PR
-  # с целевой веткой main.
+  # Вариант 14 (часть 2): автоматический контроль качества при Pull Request
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened]
 
-  # Возможность ручного запуска из GitHub UI.
   workflow_dispatch:
     inputs:
       run_docker:
@@ -26,42 +23,30 @@ on:
         type: boolean
         default: false
 
-# --------------------------------------------------
-# Минимальные права Workflow
-# --------------------------------------------------
 permissions:
   contents: read
+  # Нужно, чтобы status check был виден на PR
+  checks: write
+  pull-requests: write
 
-# --------------------------------------------------
-# Управление параллельными запусками
-# --------------------------------------------------
 concurrency:
-  group: java-ci-${{ github.ref }}
+  group: java-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
 
   # ==================================================
-  # Основное задание: сборка и тестирование
+  # Контроль качества (Quality Gate)
+  # Обязателен для push и для Pull Request
   # ==================================================
-  verify:
-
-    name: Build, unit and integration tests
-
-    # Используется GitHub-hosted Windows runner.
+  quality-gate:
+    name: Quality Gate (build + tests)
     runs-on: windows-latest
 
     steps:
-
-      # ------------------------------------------------
-      # Шаг 1. Получение исходного кода
-      # ------------------------------------------------
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ------------------------------------------------
-      # Шаг 2. Установка JDK 21
-      # ------------------------------------------------
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -69,59 +54,39 @@ jobs:
           java-version: '21'
           cache: maven
 
-      # ------------------------------------------------
-      # Шаг 3. Проверка программного окружения
-      # ------------------------------------------------
       - name: Show toolchain
         shell: pwsh
         run: |
           java -version
           mvn -version
           git --version
+          Write-Host "Event: ${{ github.event_name }}"
+          Write-Host "Ref: ${{ github.ref }}"
 
-      # ------------------------------------------------
-      # Шаг 4. Сборка и выполнение тестов
-      # ------------------------------------------------
-      - name: Build and verify
+      - name: Build and verify (unit + integration tests)
         shell: pwsh
         run: mvn -B -ntp clean verify
 
-      # ------------------------------------------------
-      # Шаг 5. Формирование HTML-отчёта Surefire
-      # Выполняется и при неуспешной сборке.
-      # ------------------------------------------------
       - name: Generate Surefire HTML report
         if: always()
         shell: pwsh
         run: |
           if (Test-Path 'target/surefire-reports') {
             mvn -B -ntp surefire-report:report-only
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
           } else {
             Write-Host 'Surefire reports are absent.'
           }
 
-      # ------------------------------------------------
-      # Шаг 6. Формирование HTML-отчёта JaCoCo
-      # ------------------------------------------------
       - name: Generate JaCoCo HTML report
         if: always()
         shell: pwsh
         run: |
           if (Test-Path 'target/jacoco.exec') {
             mvn -B -ntp jacoco:report
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
           } else {
             Write-Host 'JaCoCo execution data is absent.'
           }
 
-      # ------------------------------------------------
-      # Шаг 7. Публикация тестовых и coverage-отчётов
-      # ------------------------------------------------
       - name: Upload test and coverage reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -135,10 +100,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ------------------------------------------------
-      # Шаг 8. Публикация JAR
-      # Только при успешном выполнении Job.
-      # ------------------------------------------------
       - name: Upload executable JAR
         if: success()
         uses: actions/upload-artifact@v4
@@ -148,27 +109,52 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Явная фиксация результата Quality Gate (удобно для PR Checks)
+      - name: Quality Gate summary
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ job.status }}" -eq "success") {
+            Write-Host "QUALITY GATE PASSED: tests and build succeeded."
+            Write-Host "Pull Request can be considered ready for review (from CI perspective)."
+          } else {
+            Write-Host "QUALITY GATE FAILED: build or tests did not pass."
+            Write-Host "Pull Request must NOT be merged until the issues are fixed."
+            exit 1
+          }
+
   # ==================================================
-  # Необязательное задание Docker
+  # Доп. job только для Pull Request (вариант 14)
+  # Показывает, что контроль качества привязан к PR
+  # ==================================================
+  pr-quality-control:
+    name: PR Quality Control
+    if: github.event_name == 'pull_request'
+    needs: quality-gate
+    runs-on: windows-latest
+
+    steps:
+      - name: PR quality control status
+        shell: pwsh
+        run: |
+          Write-Host "=== Automatic Quality Control for Pull Request ==="
+          Write-Host "PR number : ${{ github.event.pull_request.number }}"
+          Write-Host "Title     : ${{ github.event.pull_request.title }}"
+          Write-Host "Head ref  : ${{ github.head_ref }}"
+          Write-Host "Base ref  : ${{ github.base_ref }}"
+          Write-Host "Quality Gate job completed successfully (needs: quality-gate)."
+          Write-Host "All required checks for this PR have passed."
+
+  # ==================================================
+  # Необязательный Docker (как в методичке)
   # ==================================================
   docker-build-smoke-test:
-
-    # Запускается только при ручном запуске
-    # с установленным флажком run_docker = true.
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_docker }}
-
     name: Build and smoke-test Linux image
-
-    # Ожидает успешного завершения основного Job.
-    needs: verify
-
+    needs: quality-gate
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
       - name: Build Docker image
         run: docker build -t task-manager-cicd:ci .
-        # Дополнительный smoke test следует реализовать
-        # в соответствии с фактическим Dockerfile.
